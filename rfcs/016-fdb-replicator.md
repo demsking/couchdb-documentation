@@ -15,16 +15,15 @@ monitoring of replication jobs.
 
 ## Abstract
 
-CouchDB replicator is the CouchDB application which runs replication jobs.
 Replication jobs can be created from documents in `_replicator` databases, or
 by `POST`-ing requests to the HTTP `/_replicate` endpoint. Previously, in
-CouchDB <= 3.x replication jobs were mapped to individual cluster nodes and a
+CouchDB <= 3.x, replication jobs were mapped to individual cluster nodes and a
 scheduler component would run up to `max_jobs` number of jobs at a time on each
 node. The new design proposes using `couch_jobs`, as described in the
 [Background Jobs
 RFC](https://github.com/apache/couchdb-documentation/blob/master/rfcs/007-background-jobs.md),
 to have a central, FDB-based queue of replication jobs. `couch_jobs`
-application would manage job scheduling and coordination. The new design also
+application will manage job scheduling and coordination. The new design also
 proposes using heterogeneous node types as defined in the [Node Types
 RFC](https://github.com/apache/couchdb-documentation/blob/master/rfcs/013-node-types.md)
 such that replication jobs will be created only on `api_frontend` nodes and run
@@ -45,16 +44,17 @@ with the `/_replicator` suffix.
 `transient` replications : Replication jobs created by `POST`-ing to the
 `/_replicate` endpoint.
 
-`persistent` replications : Replication jobs created from a document in a
+`persistent` replications : Replication jobs defined in document in a
 `_replicator` database.
 
-`continuous` replications : Jobs created with the `"continuous": true`
-parameter. When this job reaches the end of the changes feed it will continue
-waiting for new changes in a loop until the user removes the job.
+`continuous` replications : Replication jobs created with the `"continuous":
+true` parameter. These jobs will try to run continuously until the user removes
+them. They may be temporarily paused to allow other jobs to make progress.
 
-`normal` replications : Replication jobs which are not `continuous`. If the
+`one-shot` replications : Replication jobs which are not `continuous`. If the
 `"continuous":true` parameter is not specified, by default, replication jobs
-will be `normal`.
+will be `one-shot`. These jobs will try to run until they reach the end of the
+changes feed, then stop.
 
 `api_frontend node` : Database node which has the `api_frontend` type set to
 `true` as described in
@@ -69,12 +69,10 @@ Replication jobs can only be run on these nodes.
 `filtered` replications: Replications with a user-defined filter on the source
 endpoint to filter its changes feed.
 
-`replication_id` : An ID defined by replication jobs which is a hash of the
- source and target endpoint URLs, some of the options, and for filtered
- replications, the contents of the filter from the source endpoint. Replication
- IDs will change, for example, if the filter contents on the source endpoint
- changes. Computing this value may require a network round-trip to the source
- endpoint.
+`replication_id` : An ID defined by replication jobs, which is a hash of
+replication parameters that affect the result of the replication. These may
+include source and target endpoint URLs, as well as a filter function specified
+in a design document on the source endpoint.
 
 `job_id` : A replication job ID derived from the database and document IDs for
 persistent replications, and from source, target endpoint, user name and some
@@ -103,23 +101,23 @@ Replication job creation and scheduling works roughly as follows:
 
  1) `Persistent` and `transient` jobs both start by creating or updating a
  `couch_jobs` record in a separate replication key-space on `api_frontend`
- nodes. Persistent jobs are driven by an EPI callback mechanism which notifies
- `couch_replicator` application when documents in `_replicator` DBs are
- updated, or when `_replicator` DBs are created and deleted. Transient jobs are
- created from the `_replicate` HTTP handler directly. Newly created jobs are in
- a `pending` state.
+ nodes. Persistent jobs are driven by the `couch_epi` callback mechanism which
+ notifies `couch_replicator` application when documents in `_replicator` DBs
+ are updated, or when `_replicator` DBs are created and deleted. Transient jobs
+ are created from the `_replicate` HTTP handler directly. Newly created jobs
+ are in a `pending` state.
 
  2) Each `replication` node spawns some acceptor processes which wait in
  `couch_jobs:accept/2` call for jobs. It will accept only jobs which are
  scheduled to run at a time less or equal to the current time.
 
- 3) After a job is accepted, its state is updated as `running`, and then, a
+ 3) After a job is accepted, its state is updated to `running`, and then, a
  gen_server process monitoring these replication jobs will spawn another
  acceptor. That happens until the `max_jobs` limit is reached.
 
  4) The same monitoring gen_server will periodically check if there are any
- pending jobs in the queue, and if there are, spawn up to some `max_churn`
- number of new acceptors. These acceptors may start new jobs, and if they do,
+ pending jobs in the queue and, if there are, spawn up to some `max_churn`
+ number of new acceptors. These acceptors may start new jobs and, if they do,
  for each one of them, the oldest running job will be stopped and re-enqueued
  as `pending`. This in large follows the logic from the replication scheduler
  in CouchDB <= 3.x except that is uses `couch_jobs` as the central queuing and
@@ -171,7 +169,7 @@ The set of replication job states is defined as:
    backoff penalty is computed and the job is rescheduled to try again at some
    point in the future.
 
- * `completed` : Normal replications which have completed
+ * `completed` : One-Shot replications which have completed
 
  * `failed` : This can happen when:
     - A replication job could not be parsed from a replication document. For
@@ -207,7 +205,7 @@ replicator states like so:
 
 Jobs start in the `pending` state, after either a `_replicator` db doc
 update, or a POST to the `/_replicate` endpoint. Continuous jobs, will
-normally toggle between `pending` and `running` states. Normal jobs
+normally toggle between `pending` and `running` states. One-Shot jobs
 may toggle between `pending` and running a few times and then end up
 in `completed`.
 
@@ -271,7 +269,7 @@ in the cluster. If the node where the replication job ran crashes, the job
 would simply disappear without a trace. It was up to the user to periodically
 monitor the job status and re-create the job. In the current design,
 `transient` jobs are persisted to FDB as `couch_jobs` records, and so would
-survive dbcore node restarts. Also after transient jobs complete or failed,
+survive node restarts. Also after transient jobs complete or failed,
 they used to disappear immediately. This design proposes keeping them around
 for a configurable emount of time to allow users to retrive their status via
 `_scheduler/jobs/$id` API.
